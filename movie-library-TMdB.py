@@ -7,6 +7,8 @@ from pathlib import Path
 import urllib.request
 from flask import Flask, render_template_string
 from dotenv import load_dotenv
+import subprocess
+import platform
 
 # Load environment variables from .env file
 load_dotenv()
@@ -42,7 +44,8 @@ def setup_database():
             rating FLOAT,
             folder_path TEXT NOT NULL,
             last_updated DATETIME,
-            tmdb_id INTEGER
+            tmdb_id INTEGER,
+            video_path TEXT
         )
     ''')
     conn.commit()
@@ -134,6 +137,17 @@ def download_poster(poster_url, movie_title):
             print(f"Error downloading poster for {movie_title}: {e}")
     return None
 
+def find_video_file(folder_path):
+    """Find the first video file in the given folder"""
+    video_extensions = ('.mp4', '.mkv', '.avi', '.mov', '.wmv', '.m4v')
+    try:
+        for file in os.listdir(folder_path):
+            if file.lower().endswith(video_extensions):
+                return os.path.join(folder_path, file)
+    except Exception as e:
+        print(f"Error finding video file in {folder_path}: {e}")
+    return None
+
 def scan_directory(directory, conn, cursor):
     """Recursively scan directory for movie folders"""
     for folder_name in os.listdir(directory):
@@ -152,18 +166,20 @@ def scan_directory(directory, conn, cursor):
                     movie_info = fetch_movie_info(title, year)
                     if movie_info:
                         poster_path = download_poster(movie_info['poster_url'], movie_info['title'])
+                        video_path = find_video_file(folder_path)
                         
                         cursor.execute('''
                             INSERT INTO movies (
                                 title, year, director, countries, poster_path,
                                 plot, genres, rating, folder_path, last_updated,
-                                tmdb_id
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                tmdb_id, video_path
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         ''', (
                             movie_info['title'], movie_info['year'], movie_info['director'],
                             movie_info['countries'], poster_path, movie_info['plot'],
                             movie_info['genres'], movie_info['rating'],
-                            folder_path, datetime.now(), movie_info['tmdb_id']
+                            folder_path, datetime.now(), movie_info['tmdb_id'],
+                            video_path
                         ))
             else:
                 scan_directory(folder_path, conn, cursor)
@@ -192,7 +208,7 @@ def display_library():
     movies = c.fetchall()
     conn.close()
     
-    template = '''<!DOCTYPE html>
+    return render_template_string('''<!DOCTYPE html>
 <html data-theme="dark">
 <head>
     <title>Movie Library</title>
@@ -335,6 +351,29 @@ def display_library():
             line-height: 1.5;
         }
 
+        .play-button {
+            background: #4CAF50;
+            color: white;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 5px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-top: 12px;
+            transition: background-color 0.2s;
+        }
+
+        .play-button:hover {
+            background: #45a049;
+        }
+
+        .play-button svg {
+            width: 16px;
+            height: 16px;
+        }
+
         .theme-toggle {
             position: fixed;
             top: 20px;
@@ -397,6 +436,14 @@ def display_library():
                 <p class="genres">{{ movie['genres'] }}</p>
                 <p class="rating">★ {{ "%.1f"|format(movie['rating']) }}/10</p>
                 <p class="plot">{{ movie['plot'] }}</p>
+                {% if movie['video_path'] %}
+                <button class="play-button" onclick="playMovie({{ movie['id'] }})">
+                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <polygon points="5 3 19 12 5 21 5 3"/>
+                    </svg>
+                    Play in VLC
+                </button>
+                {% endif %}
             </div>
         </div>
         {% endfor %}
@@ -461,16 +508,59 @@ def display_library():
             
             movies.forEach(movie => movieGrid.appendChild(movie));
         }
+
+        function playMovie(movieId) {
+            fetch(`/play/${movieId}`)
+                .then(response => {
+                    if (!response.ok) {
+                        throw new Error('Failed to launch movie');
+                    }
+                })
+                .catch(error => {
+                    console.error('Error:', error);
+                    alert('Error launching movie. Please make sure VLC is installed.');
+                });
+        }
     </script>
 </body>
-</html>'''
+</html>''', 
+    movies=movies,
+    directors=sorted(set(m['director'] for m in movies if m['director'])),
+    genres=sorted(set(genre.strip() for m in movies if m['genres'] for genre in m['genres'].split(','))))
+
+@app.route('/play/<int:movie_id>')
+def play_movie(movie_id):
+    conn = sqlite3.connect(DATABASE_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute('SELECT video_path FROM movies WHERE id = ?', (movie_id,))
+    movie = c.fetchone()
+    conn.close()
     
-    return render_template_string(
-        template,
-        movies=movies,
-        directors=sorted(set(m['director'] for m in movies if m['director'])),
-        genres=sorted(set(genre.strip() for m in movies if m['genres'] for genre in m['genres'].split(',')))
-    )
+    if movie and movie['video_path']:
+        try:
+            # Determine the VLC command based on the operating system
+            if platform.system() == 'Windows':
+                # Try common Windows VLC locations
+                vlc_paths = [
+                    r'C:\Program Files\VideoLAN\VLC\vlc.exe',
+                    r'C:\Program Files (x86)\VideoLAN\VLC\vlc.exe'
+                ]
+                vlc_path = next((path for path in vlc_paths if os.path.exists(path)), None)
+                
+                if vlc_path:
+                    subprocess.Popen([vlc_path, movie['video_path']])
+                else:
+                    return "VLC not found. Please install VLC or verify its installation path.", 500
+            else:
+                # For Unix-like systems
+                subprocess.Popen(['vlc', movie['video_path']])
+            
+            return "Movie launched in VLC", 200
+        except Exception as e:
+            return f"Error launching movie: {str(e)}", 500
+    
+    return "Movie file not found", 404
 
 if __name__ == '__main__':
     # Setup database and scan for movies
