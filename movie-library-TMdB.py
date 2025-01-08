@@ -6,24 +6,27 @@ import requests
 from pathlib import Path
 import urllib.request
 from flask import Flask, render_template_string
-
-# Configuration
-import os
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
 load_dotenv()
 
+# Configuration
 MOVIES_DIR = os.getenv('MOVIES_DIR', 'path/to/your/movies/folder')
 DATABASE_PATH = "movies.db"
 TMDB_API_KEY = os.getenv('TMDB_API_KEY')
 if not TMDB_API_KEY:
     raise ValueError("TMDB_API_KEY environment variable is not set")
 TMDB_BASE_URL = "https://api.themoviedb.org/3"
-TMDB_IMAGE_BASE_URL = "https://image.tmdb.org/t/p/w500"  # w500 is the image width
+TMDB_IMAGE_BASE_URL = "https://image.tmdb.org/t/p/w500"
 
 def setup_database():
     """Create SQLite database and tables if they don't exist"""
+    # Delete existing database if it exists
+    if os.path.exists(DATABASE_PATH):
+        os.remove(DATABASE_PATH)
+        print(f"Deleted existing database: {DATABASE_PATH}")
+
     conn = sqlite3.connect(DATABASE_PATH)
     c = conn.cursor()
     c.execute('''
@@ -71,7 +74,6 @@ def get_director_from_credits(movie_id):
 
 def fetch_movie_info(title, year):
     """Fetch movie information from TMDB API"""
-    # First, search for the movie
     search_url = f"{TMDB_BASE_URL}/search/movie"
     params = {
         "api_key": TMDB_API_KEY,
@@ -86,10 +88,8 @@ def fetch_movie_info(title, year):
             if not results:
                 return None
             
-            # Get the first result's ID
             movie_id = results[0]['id']
             
-            # Get detailed movie info
             details_url = f"{TMDB_BASE_URL}/movie/{movie_id}"
             params = {
                 "api_key": TMDB_API_KEY,
@@ -100,12 +100,11 @@ def fetch_movie_info(title, year):
             if details_response.status_code == 200:
                 data = details_response.json()
                 
-                # Get director
                 director = get_director_from_credits(movie_id)
                 
                 return {
                     'title': data.get('title'),
-                    'year': year,  # Use the year from folder name for consistency
+                    'year': year,
                     'director': director,
                     'countries': ', '.join(c['iso_3166_1'] for c in data.get('production_countries', [])),
                     'poster_url': f"{TMDB_IMAGE_BASE_URL}{data.get('poster_path')}" if data.get('poster_path') else None,
@@ -124,11 +123,13 @@ def download_poster(poster_url, movie_title):
         posters_dir = Path('posters')
         posters_dir.mkdir(exist_ok=True)
         
-        poster_path = posters_dir / f"{movie_title.replace(' ', '_')}.jpg"
+        safe_title = "".join(c if c.isalnum() or c in (' ', '-', '_') else '_' for c in movie_title)
+        filename = f"{safe_title.replace(' ', '_')}.jpg"
+        poster_path = posters_dir / filename
         
         try:
             urllib.request.urlretrieve(poster_url, poster_path)
-            return str(poster_path)
+            return f"/static/{filename}"
         except Exception as e:
             print(f"Error downloading poster for {movie_title}: {e}")
     return None
@@ -136,7 +137,6 @@ def download_poster(poster_url, movie_title):
 def scan_directory(directory, conn, cursor):
     """Recursively scan directory for movie folders"""
     for folder_name in os.listdir(directory):
-        # Skip the posters directory and any hidden folders
         if folder_name == 'posters' or folder_name.startswith('.'):
             continue
             
@@ -144,8 +144,7 @@ def scan_directory(directory, conn, cursor):
         if os.path.isdir(folder_path):
             title, year = parse_movie_folder(folder_name)
             
-            if year:  # This is a movie folder
-                # Check if movie already exists in database
+            if year:
                 cursor.execute('SELECT id FROM movies WHERE folder_path = ?', (folder_path,))
                 result = cursor.fetchone()
                 
@@ -166,7 +165,7 @@ def scan_directory(directory, conn, cursor):
                             movie_info['genres'], movie_info['rating'],
                             folder_path, datetime.now(), movie_info['tmdb_id']
                         ))
-            else:  # This might be a director folder, scan it recursively
+            else:
                 scan_directory(folder_path, conn, cursor)
 
 def scan_and_update_database():
@@ -180,6 +179,10 @@ def scan_and_update_database():
 # Flask web application for displaying the movie library
 app = Flask(__name__)
 
+# Configure static folder directly to the posters directory
+app.static_folder = 'posters'
+app.static_url_path = '/static'
+
 @app.route('/')
 def display_library():
     conn = sqlite3.connect(DATABASE_PATH)
@@ -189,50 +192,285 @@ def display_library():
     movies = c.fetchall()
     conn.close()
     
-    return render_template_string('''
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>Movie Library</title>
-            <style>
-                body { font-family: Arial, sans-serif; margin: 20px; background-color: #f0f0f0; }
-                .movie-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 20px; }
-                .movie-card {
-                    background: white;
-                    padding: 15px;
-                    border-radius: 10px;
-                    box-shadow: 0 2px 5px rgba(0,0,0,0.1);
-                }
-                .movie-card img { max-width: 100%; height: auto; border-radius: 5px; }
-                .movie-info { margin-top: 10px; }
-                h1 { color: #333; }
-                h2 { margin: 10px 0; color: #444; font-size: 1.2em; }
-                .rating { color: #f39c12; font-weight: bold; }
-                .genres { color: #666; font-style: italic; }
-            </style>
-        </head>
-        <body>
-            <h1>Movie Library</h1>
-            <div class="movie-grid">
-                {% for movie in movies %}
-                <div class="movie-card">
-                    {% if movie['poster_path'] %}
-                    <img src="{{ movie['poster_path'] }}" alt="{{ movie['title'] }} poster">
-                    {% endif %}
-                    <div class="movie-info">
-                        <h2>{{ movie['title'] }} ({{ movie['year'] }})</h2>
-                        <p><strong>Director:</strong> {{ movie['director'] }}</p>
-                        <p><strong>Countries:</strong> {{ movie['countries'] }}</p>
-                        <p class="genres">{{ movie['genres'] }}</p>
-                        <p class="rating">Rating: {{ "%.1f"|format(movie['rating']) }}/10</p>
-                        <p>{{ movie['plot'] }}</p>
-                    </div>
-                </div>
+    template = '''<!DOCTYPE html>
+<html data-theme="dark">
+<head>
+    <title>Movie Library</title>
+    <style>
+        :root[data-theme="light"] {
+            --bg-color: #f0f0f0;
+            --card-bg: #ffffff;
+            --text-color: #333333;
+            --title-color: #222222;
+            --secondary-text: #666666;
+            --border-color: #dddddd;
+        }
+        
+        :root[data-theme="dark"] {
+            --bg-color: #1a1a1a;
+            --card-bg: #2d2d2d;
+            --text-color: #e0e0e0;
+            --title-color: #ffffff;
+            --secondary-text: #b0b0b0;
+            --border-color: #404040;
+        }
+
+        body { 
+            font-family: Arial, sans-serif; 
+            margin: 20px; 
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            transition: all 0.3s ease;
+        }
+
+        .controls {
+            display: flex;
+            gap: 20px;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+            align-items: center;
+        }
+
+        .control-group {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+
+        input, select {
+            padding: 8px;
+            border-radius: 5px;
+            border: 1px solid var(--border-color);
+            background: var(--card-bg);
+            color: var(--text-color);
+        }
+
+        button {
+            padding: 8px 16px;
+            border-radius: 5px;
+            border: 1px solid var(--border-color);
+            background: var(--card-bg);
+            color: var(--text-color);
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+
+        button:hover {
+            background: var(--border-color);
+        }
+
+        .movie-grid { 
+            display: grid; 
+            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); 
+            gap: 20px; 
+        }
+
+        .movie-card {
+            background: var(--card-bg);
+            padding: 15px;
+            border-radius: 10px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.3);
+            transition: transform 0.2s ease-in-out;
+        }
+
+        .movie-card.hidden {
+            display: none;
+        }
+
+        .movie-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 5px 15px rgba(0,0,0,0.4);
+        }
+
+        .movie-card img { 
+            width: 100%;
+            height: auto; 
+            border-radius: 5px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.2);
+        }
+
+        .movie-info { 
+            margin-top: 10px; 
+        }
+
+        h1 { 
+            color: var(--title-color);
+            border-bottom: 2px solid var(--border-color);
+            padding-bottom: 10px;
+        }
+
+        h2 { 
+            margin: 10px 0; 
+            color: var(--title-color);
+            font-size: 1.2em;
+        }
+
+        .rating { 
+            color: #ffd700; 
+            font-weight: bold;
+            background: var(--border-color);
+            padding: 3px 8px;
+            border-radius: 5px;
+            display: inline-block;
+        }
+
+        .genres { 
+            color: var(--secondary-text);
+            font-style: italic;
+        }
+
+        strong {
+            color: var(--title-color);
+        }
+
+        p {
+            margin: 8px 0;
+            line-height: 1.4;
+        }
+
+        .plot {
+            color: var(--text-color);
+            font-size: 0.95em;
+            margin-top: 12px;
+            line-height: 1.5;
+        }
+
+        .theme-toggle {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            z-index: 1000;
+        }
+    </style>
+</head>
+<body>
+    <button class="theme-toggle" onclick="toggleTheme()">🌓 Toggle Theme</button>
+    <h1>Movie Library</h1>
+    
+    <div class="controls">
+        <div class="control-group">
+            <input type="text" id="searchInput" placeholder="Search movies..." onkeyup="filterMovies()">
+        </div>
+        
+        <div class="control-group">
+            <select id="directorFilter" onchange="filterMovies()">
+                <option value="">All Directors</option>
+                {% for director in directors %}
+                    <option value="{{ director }}">{{ director }}</option>
                 {% endfor %}
+            </select>
+
+            <select id="genreFilter" onchange="filterMovies()">
+                <option value="">All Genres</option>
+                {% for genre in genres %}
+                    <option value="{{ genre }}">{{ genre }}</option>
+                {% endfor %}
+            </select>
+        </div>
+
+        <div class="control-group">
+            <select id="sortBy" onchange="sortMovies()">
+                <option value="title">Sort by Title</option>
+                <option value="year">Sort by Year</option>
+                <option value="rating">Sort by Rating</option>
+                <option value="director">Sort by Director</option>
+            </select>
+            <button onclick="toggleSortDirection()">↑↓</button>
+        </div>
+    </div>
+
+    <div class="movie-grid">
+        {% for movie in movies %}
+        <div class="movie-card" 
+             data-title="{{ movie['title']|lower }}"
+             data-year="{{ movie['year'] }}"
+             data-rating="{{ movie['rating'] }}"
+             data-director="{{ movie['director']|lower }}"
+             data-genres="{{ movie['genres']|lower }}">
+            {% if movie['poster_path'] %}
+            <img src="{{ movie['poster_path'] }}" alt="{{ movie['title'] }} poster">
+            {% endif %}
+            <div class="movie-info">
+                <h2>{{ movie['title'] }} ({{ movie['year'] }})</h2>
+                <p><strong>Director:</strong> {{ movie['director'] }}</p>
+                <p><strong>Countries:</strong> {{ movie['countries'] }}</p>
+                <p class="genres">{{ movie['genres'] }}</p>
+                <p class="rating">★ {{ "%.1f"|format(movie['rating']) }}/10</p>
+                <p class="plot">{{ movie['plot'] }}</p>
             </div>
-        </body>
-        </html>
-    ''', movies=movies)
+        </div>
+        {% endfor %}
+    </div>
+
+    <script>
+        let sortDirection = 1; // 1 for ascending, -1 for descending
+
+        function toggleTheme() {
+            const html = document.documentElement;
+            const currentTheme = html.getAttribute('data-theme');
+            const newTheme = currentTheme === 'dark' ? 'light' : 'dark';
+            html.setAttribute('data-theme', newTheme);
+            localStorage.setItem('theme', newTheme);
+        }
+
+        // Load saved theme preference
+        const savedTheme = localStorage.getItem('theme') || 'dark';
+        document.documentElement.setAttribute('data-theme', savedTheme);
+
+        function filterMovies() {
+            const searchTerm = document.getElementById('searchInput').value.toLowerCase();
+            const selectedDirector = document.getElementById('directorFilter').value.toLowerCase();
+            const selectedGenre = document.getElementById('genreFilter').value.toLowerCase();
+            
+            document.querySelectorAll('.movie-card').forEach(card => {
+                const title = card.getAttribute('data-title');
+                const director = card.getAttribute('data-director');
+                const genres = card.getAttribute('data-genres');
+                
+                const matchesSearch = title.includes(searchTerm);
+                const matchesDirector = !selectedDirector || director.includes(selectedDirector);
+                const matchesGenre = !selectedGenre || genres.includes(selectedGenre);
+                
+                card.classList.toggle('hidden', !(matchesSearch && matchesDirector && matchesGenre));
+            });
+        }
+
+        function toggleSortDirection() {
+            sortDirection *= -1;
+            sortMovies();
+        }
+
+        function sortMovies() {
+            const sortBy = document.getElementById('sortBy').value;
+            const movieGrid = document.querySelector('.movie-grid');
+            const movies = Array.from(document.querySelectorAll('.movie-card'));
+            
+            movies.sort((a, b) => {
+                let valueA = a.getAttribute('data-' + sortBy);
+                let valueB = b.getAttribute('data-' + sortBy);
+                
+                if (sortBy === 'rating' || sortBy === 'year') {
+                    valueA = parseFloat(valueA);
+                    valueB = parseFloat(valueB);
+                }
+                
+                if (valueA < valueB) return -1 * sortDirection;
+                if (valueA > valueB) return 1 * sortDirection;
+                return 0;
+            });
+            
+            movies.forEach(movie => movieGrid.appendChild(movie));
+        }
+    </script>
+</body>
+</html>'''
+    
+    return render_template_string(
+        template,
+        movies=movies,
+        directors=sorted(set(m['director'] for m in movies if m['director'])),
+        genres=sorted(set(genre.strip() for m in movies if m['genres'] for genre in m['genres'].split(',')))
+    )
 
 if __name__ == '__main__':
     # Setup database and scan for movies
