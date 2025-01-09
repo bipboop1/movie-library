@@ -616,7 +616,7 @@ def play_movie(movie_id):
         except Exception as e:
             return f"Error launching movie: {str(e)}", 500
     
-    return "Movie file not found", 404s
+    return "Movie file not found", 404
 
 if __name__ == '__main__':
     # Setup database if it doesn't exist
