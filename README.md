@@ -11,7 +11,6 @@ personal movie library for easy viewing of local movies in a given folder
 - mark as seen
 - launch from movie directory, create movides.db inside directory, keep .db here and don't delete on startup
 - trigger library refresh
-// - movies dir path should be set when running command, not as an environment variable
 
 
 
